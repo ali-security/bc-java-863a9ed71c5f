@@ -1,0 +1,144 @@
+name: seal-build
+
+# Bouncy Castle 1.57 ships no GitHub Actions CI; it builds with Ant (build15+ ->
+# ant/jdk15+.xml) and tests with the Ant junit batch over every **/AllTests.java.
+# This workflow replays that: artifacts compiled by a JDK 7 (the published jar's
+# "Originally-Created-By: 24.95-b01" is a JDK 7 VM), the test suite run on
+# OpenJDK 8 (Oracle-style JCE refuses the locally built, unsigned bcprov-ext
+# provider jar).
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated fully-qualified test classes to run instead of the full AllTests batch (empty = full suite)"
+        required: false
+        default: ""
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      ANT_VERSION: 1.9.16
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install JDK 7, Ant, the test JDK and the jars bc-build.properties names
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dl"
+          cd "$RUNNER_TEMP/dl"
+          # JDK 7 for the artifact build (setup-java no longer resolves Zulu 7).
+          curl -fsSL -o jdk7.tgz "https://cdn.azul.com/zulu/bin/zulu7.56.0.11-ca-jdk7.0.352-linux_x64.tar.gz"
+          mkdir -p "$RUNNER_TEMP/jdk7"
+          tar xzf jdk7.tgz -C "$RUNNER_TEMP/jdk7" --strip-components=1
+          echo "JDK7_HOME=$RUNNER_TEMP/jdk7" >> "$GITHUB_ENV"
+          # Ant 1.9.x is the newest line that still runs on Java 5-7.
+          curl -fsSL -o ant.tgz "https://archive.apache.org/dist/ant/binaries/apache-ant-${ANT_VERSION}-bin.tar.gz"
+          tar xzf ant.tgz -C "$RUNNER_TEMP"
+          echo "ANT_HOME=$RUNNER_TEMP/apache-ant-${ANT_VERSION}" >> "$GITHUB_ENV"
+          # OpenJDK 8u292 for the test JVM: OpenJDK does not enforce JCE provider-jar signing.
+          curl -fsSL -o jdk8.tgz "https://github.com/AdoptOpenJDK/openjdk8-binaries/releases/download/jdk8u292-b10/OpenJDK8U-jdk_x64_linux_hotspot_8u292b10.tar.gz"
+          mkdir -p "$RUNNER_TEMP/jdk8"
+          tar xzf jdk8.tgz -C "$RUNNER_TEMP/jdk8" --strip-components=1
+          echo "JDK8_HOME=$RUNNER_TEMP/jdk8" >> "$GITHUB_ENV"
+          # bc-build.properties hardcodes these three paths as project.classpath.
+          # javax.mail is exactly 1.4, the version mail/build.gradle declares.
+          M=https://repo.maven.apache.org/maven2
+          sudo mkdir -p /opt/junit /opt/javamail /opt/jaf
+          curl -fsSL -o junit.jar "$M/junit/junit/4.12/junit-4.12.jar"
+          curl -fsSL -o hamcrest-core.jar "$M/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar"
+          curl -fsSL -o mail.jar "$M/javax/mail/mail/1.4/mail-1.4.jar"
+          curl -fsSL -o activation.jar "$M/javax/activation/activation/1.1.1/activation-1.1.1.jar"
+          sudo cp junit.jar /opt/junit/junit.jar
+          sudo cp mail.jar /opt/javamail/mail.jar
+          sudo cp activation.jar /opt/jaf/activation.jar
+          cp junit.jar hamcrest-core.jar "$RUNNER_TEMP/apache-ant-${ANT_VERSION}/lib/"
+
+      - name: Build (build15+ -> ant/jdk15+.xml build-provider, build)
+        run: |
+          set -euo pipefail
+          export JAVA_HOME="$JDK7_HOME"
+          export PATH="$JAVA_HOME/bin:$ANT_HOME/bin:$PATH"
+          java -version
+          ant -version
+          # Same targets build15+ runs, but fail-fast (build15+ ignores a failing "build").
+          ant -f ant/jdk15+.xml build-provider
+          ant -f ant/jdk15+.xml build
+
+      - name: Stage bcpkix jar (public OSGi main manifest section + pack200 repack)
+        run: |
+          set -euo pipefail
+          export PATH="$JDK7_HOME/bin:$PATH"
+          BUILT=build/artifacts/jdk1.5/jars/bcpkix-jdk15on-157.jar
+          test -f "$BUILT"
+          # BC's release runs a bnd pass the source tree does not ship, which writes the
+          # OSGi headers (Bundle-*, Export-Package, Import-Package, ...). Reuse the main
+          # section of the published 1.57 manifest; per-entry digest sections and the
+          # META-INF signature files are not copied.
+          W="$RUNNER_TEMP/stage"
+          mkdir -p "$W/classes" dist
+          curl -fsSL -o "$W/public.jar" https://repo.maven.apache.org/maven2/org/bouncycastle/bcpkix-jdk15on/1.57/bcpkix-jdk15on-1.57.jar
+          unzip -p "$W/public.jar" META-INF/MANIFEST.MF > "$W/public.MF"
+          tr -d '\r' < "$W/public.MF" | awk 'f {next} /^$/ {f=1; next} {print}' > "$W/MANIFEST.MF"
+          (cd "$W/classes" && unzip -q "$GITHUB_WORKSPACE/$BUILT")
+          rm -f "$W/classes/META-INF/MANIFEST.MF"
+          find "$W/classes/META-INF" -maxdepth 0 -empty -delete
+          jar cfm dist/bcpkix-jdk15on-1.57.jar "$W/MANIFEST.MF" -C "$W/classes" .
+          # Upstream's pack200-on target normalizes every release jar with
+          # <pack200 repack="true" segmentLimit="-1"/> (canonical constant-pool order).
+          pack200 --repack --segment-limit=-1 dist/bcpkix-jdk15on-1.57.jar
+          unzip -p dist/bcpkix-jdk15on-1.57.jar META-INF/MANIFEST.MF > "$W/ours.MF"
+          grep -E "^(Bundle-SymbolicName|Export-Package|Import-Package|Bundle-Version)" "$W/ours.MF" | cut -c1-80
+          unzip -l dist/bcpkix-jdk15on-1.57.jar | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bcpkix-jdk15on-1.57
+          path: dist/bcpkix-jdk15on-1.57.jar
+          if-no-files-found: error
+
+      - name: Test (ant/jdk15+.xml test -> junit batch over every AllTests)
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -euo pipefail
+          export JAVA_HOME="$JDK8_HOME"
+          export PATH="$JAVA_HOME/bin:$ANT_HOME/bin:$PATH"
+          java -version
+          if [ -z "$TEST_FILTER" ]; then
+            ant -f ant/jdk15+.xml test
+          else
+            for t in $TEST_FILTER; do
+              ant -f ant/jdk15+.xml -Dtestcase="$t" test
+            done
+          fi
+
+      - name: Test summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, xml.etree.ElementTree as ET
+          files = sorted(glob.glob("build/**/TEST-*.xml", recursive=True))
+          tot = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          skips = []
+          for f in files:
+              r = ET.parse(f).getroot()
+              n = {k: int(r.get(k, 0) or 0) for k in tot}
+              for k in tot:
+                  tot[k] += n[k]
+              print("SUITE %-60s tests=%d failures=%d errors=%d skipped=%d" % (r.get("name"), n["tests"], n["failures"], n["errors"], n["skipped"]))
+              for tc in r.iter("testcase"):
+                  s = tc.find("skipped")
+                  if s is not None:
+                      skips.append("%s.%s: %s" % (tc.get("classname"), tc.get("name"), s.get("message") or "no reason given"))
+          print("=" * 70)
+          print("SUITES=%d TESTS=%d FAILURES=%d ERRORS=%d SKIPPED=%d PASSED=%d" % (len(files), tot["tests"], tot["failures"], tot["errors"], tot["skipped"], tot["tests"] - tot["failures"] - tot["errors"] - tot["skipped"]))
+          for s in skips:
+              print("SKIPPED " + s)
+          if not files:
+              raise SystemExit("no JUnit reports found")
+          EOF

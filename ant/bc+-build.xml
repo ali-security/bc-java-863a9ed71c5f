@@ -762,9 +762,16 @@
 
     <target name="test">
         <mkdir dir="${basedir}/${build.dir}/${target.prefix}" />
-        <junit fork="yes" dir="${basedir}/${build.dir}/${target.prefix}" failureProperty="test.failed">
+        <junit fork="yes" dir="${basedir}/${build.dir}/${target.prefix}" failureProperty="test.failed" errorProperty="test.failed" printsummary="withOutAndErr">
+            <!-- The build container's default locale is POSIX/C, so the JVM picks
+                 ANSI_X3.4-1968 for file.encoding and every non-ASCII character a test
+                 pushes through String.getBytes() degrades to '?' - e.g.
+                 "OpenBSDBCrypt: bcryptTest2b mismatch: ????????????????".
+                 The task is forked, so this jvmarg reaches the test JVM and gives it a
+                 UTF-8 default charset. -->
+            <jvmarg value="-Dfile.encoding=UTF-8" />
             <classpath>
-                <path refid="project.classpath" /> 
+                <path refid="project.classpath" />
                 <fileset dir="${artifacts.jars.dir}">
                     <include name="**/*.jar" />
                     <exclude name="**/bcprov-jdk*.jar" />
@@ -773,6 +780,12 @@
             <sysproperty key="bc.test.data.home" value="../../core/src/test/data" />
 
             <formatter type="xml" />
+            <!-- Upstream configures only the xml formatter, so a failing suite logs a bare
+                 "Test <class> FAILED" with no counts and no stack trace. The plain
+                 console formatter puts the per-suite run/failure counts and the assertion
+                 text in the build log where they can actually be read. -->
+            <formatter type="plain" usefile="false" />
+            <test name="${testcase}" todir="${artifacts.reports.xml.dir}" if="testcase" />
             <batchtest todir="${artifacts.reports.xml.dir}" unless="testcase">
                 <fileset dir="${src.dir}">
                     <include name="**/AllTests.java" />
@@ -786,6 +799,8 @@
             </fileset>
             <report format="frames" todir="${artifacts.reports.html.dir}" />
         </junitreport>
+
+        <fail if="test.failed" message="JUnit tests failed or errored - see reports under ${artifacts.reports.xml.dir}" />
     </target>
 
     <target name="test-lw">
